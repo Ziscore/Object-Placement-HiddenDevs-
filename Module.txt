@@ -1,0 +1,754 @@
+--[[Non-Changing Private Refrences]]--
+
+--Services
+
+local RunService = game:GetService("RunService")
+
+local UserInputService = game:GetService("UserInputService")
+
+local ContextActionService = game:GetService("ContextActionService")
+
+local PlayerService = game:GetService("Players")
+
+local WasteLand = game:GetService("Debris")
+
+local TweenService = game:GetService("TweenService")
+
+local CollectionService = game:GetService("CollectionService")
+
+local SoundService = game:GetService("SoundService")
+
+--Modules
+
+-- The functions needed have been merged here for showcase.
+
+--Remotes
+
+local PlacementHandler = script.PlacementHandler
+
+--Local
+
+local Player = PlayerService.LocalPlayer
+
+local Camera = workspace.CurrentCamera
+
+local PlayerRoot = Player.Character.HumanoidRootPart
+
+--Zeros  -- Used to avoid constructing a new Vector / CFrame everytime a zero is needed
+
+local ZeroCFrame = CFrame.new(0, 0, 0)
+
+local ZeroVector = Vector3.zero
+
+--Params  -- Used to avoid constructing new params every frame
+
+local RayParams = RaycastParams.new() 
+
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+RayParams.FilterDescendantsInstances = {workspace.Humanoids}  -- Can be whatever you want the items to ignore while being placed
+
+local LapParams = OverlapParams.new()
+
+LapParams.FilterType = Enum.RaycastFilterType.Include
+
+LapParams.FilterDescendantsInstances = {CollectionService:GetTagged("Avoid")}
+
+--Tables
+
+local XYZ = {  -- Used for getting the relative axis while accounting for rotation to calculate the right placement offset.
+
+	[1] = "X",
+
+	[2] = "Y",
+
+	[3] = "Z",
+}
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+--[[Changing Private References]]-- Required in multiple parts of the script but are rapidly changing.
+
+--Position details
+
+local CurrentTrackFunction : (nil) -> nil  -- A function that raycasts according to the current PlacementMode set (PlacementModes defined at line 637)
+
+local CurrentTrackedPositionData : RaycastResult | table  -- Can be a table containing manually calculated Position, Normal in the case the raycast doesn't hit anything and the current PlacementMode is at camera center. 
+
+local CurrentFinalCFrame : CFrame  -- The CFrame that the currently previewed item is to be tweened to
+
+--Item details
+
+local CurrentItem: BasePart | Model
+
+local CurrentItemPreview: BasePart | Model  -- The clone of the current selected item to be displayed for the player,
+
+local PreviewPrimaryPart : BasePart
+
+local CurrentPreviewSize : Vector3
+
+local HalvedPreviewSize : Vector3
+
+--Validation details
+
+local CanPlace : boolean
+
+local CurrentPlacementDistance : number = 0  --[[
+
+Only used when the PlacementMode is camera centered or locked to infront of the player to allow for distance changing between the player and preview--]]
+
+--Tweens  -- To avoid creating a new tween every time it is needed when it's the exact same as the previous tween
+
+local HighlightValid : Tween
+
+local HighlightInvalid : Tween
+
+--KeyBind holding booleans  -- Keybinds are defined at line 448
+
+local IsRotating : boolean
+
+local IsPosRotating : boolean -- Used for keybind "Rot1"
+
+local IsNegRotating : boolean -- Used for keybind "Rot2"
+
+local IsPosMoving : boolean   -- Used for keybinds "MoveDis1"
+
+local IsNegMoving : boolean   -- Used for keybind "MoveDis2"
+
+--Technical details
+
+local CurrentCycleListIndex : number = 1  -- Used to keep track of what item is to be chosen next through item cycling.
+
+local CurrentPlayerAppliedRotation : CFrame = ZeroCFrame
+
+local CurrentScriptAppliedRotation : CFrame = ZeroCFrame  -- Used for changing the relevance of the rotation to the world
+
+local RunServiceConnection : RBXScriptConnection
+
+local CollectionServiceConnection : RBXScriptConnection --[[ 
+
+To avoid using CollectionService:GetTagged() every frame instead it is only updated when an instance is added to the identifying tag--]]
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+local BuildMode = {
+	
+	--Public tables  -- Useful to be edited from other scripts
+	
+	Settings = {  
+
+		--Color values--
+
+		ColorWhenValid = Color3.fromRGB(0, 0, 200),
+
+		ColorWhenInvalid = Color3.fromRGB(200, 0, 0),
+
+		OutlineColor = Color3.fromRGB(0, 0, 0),
+		
+		
+		--Features-- disable any that are not needed to increase performance
+		
+		GridSnappingEnabled = false,
+		
+		CollisionDetectionEnabled = true,
+		
+		BoundsEnabled = true,
+				
+		HeightLimitsEnabled = true,
+		
+		--TiltingEnabled = true, -- TODO : work
+		
+		--ServerPreviewEnabled = false, -- TODO : work
+		
+		--PartSnappingEnabled = true, -- TODO : work
+		
+				
+		--Tweens--
+
+		HighlightTweenInfo = TweenInfo.new(0.25),
+
+		PositionTweenInfo = TweenInfo.new(0.15),
+		
+
+		--Modes--
+		
+		PlacementMode = 1, -- Modes defined at line 500
+		
+		RotationMode = 1, --[[ Either 1 or 2 
+		
+		- 1 means rotation is incremented by "RotationValue" (Line 195) once every click and X axis rotation is allowed.
+		
+		- 2 means rotation is incremented by "RotationSpeed" (Line 197) while the rotation key is held and X axis rotation is not allowed (Due to clipping issues)--]] 
+		
+		
+		--Constraints--
+		
+		MinPlacementHeight = 0,
+
+		MaxPlacementHeight = 100,
+		
+		MaxPlacementDistance = 100,
+		
+		
+		--Rotation--
+		
+		RotationValue = math.pi / 2, -- Must be equal to either 90 or 180 degrees when X axis rotation is enabled due to how rotational offsets are calculated.
+				
+		RotationSpeed = math.pi / 90,
+							
+							
+		--Other values--
+
+		CollisionIdentifyingTag = "Avoid", -- The name of the CollectionService tag identifying items included in collision detection with the current item being placed.
+		
+		GridSize = 1,
+		
+		PlacementSound = SoundService.Place,
+	},
+
+	CycleList = script.ItemList:GetChildren(), -- The table of items to be iterated through for item cycling.
+	
+	BoundsRegistered = {workspace.Plot}, --[[
+	
+	Sizes and Positions of all the bounds registered, you may insert a BasePart representing bounds or a table including a Size and Position such as 
+	
+	{Size = Vector3.new(100, 1, 100), Position = Vector3.new(0, 0, 0)} !!! SIZE X MUST BE EQUAL TO SIZE Z !!! otherwise it won't be 100% accurate  - - -  TODO: fix--]]
+}
+
+--[[Local Functions]]--
+
+--Related to positioning.
+
+local function GetRelativePositionData(OriginCFrame: CFrame, Position: Vector3)  :  string | Vector3 | Vector3  -- Mostly used to get the correct relevant axis to be used for placement offsetting while account for rotation.
+
+	local RelativePosition = OriginCFrame:PointToObjectSpace(Position)
+
+	local AbsPosition = RelativePosition:Abs()
+
+	local AxisTable = {
+
+		[1] = AbsPosition.X,
+
+		[2] = AbsPosition.Y,
+
+		[3] = AbsPosition.Z,
+	}
+
+	return XYZ[table.find(AxisTable, math.max(AbsPosition.X, AbsPosition.Y, AbsPosition.Z))], AbsPosition, RelativePosition
+end
+
+local function CalculateFinalCFrame()
+
+	local PreviewSize = typeof(CurrentTrackedPositionData) == "RaycastResult" and HalvedPreviewSize or ZeroVector  -- To correctly calculate offsets when the current PlacementMode is at camera center.
+
+	local Position = CurrentTrackedPositionData.Position
+	
+	LastPosition = Position
+			
+	if BuildMode.Settings.GridSnappingEnabled then
+
+		local GridSize = BuildMode.Settings.GridSize
+
+		Position = Vector3.new(
+
+			math.floor(CurrentTrackedPositionData.Position.X / GridSize + 0.5) * GridSize,
+
+			math.floor(CurrentTrackedPositionData.Position.Y / GridSize + 0.5) * GridSize,
+
+			math.floor(CurrentTrackedPositionData.Position.Z / GridSize + 0.5) * GridSize
+		)	
+	end
+	
+	local TotalRotation = CurrentPlayerAppliedRotation * CurrentScriptAppliedRotation
+
+	local OffsetRotatedCFrame = CFrame.new(Position + CurrentTrackedPositionData.Normal * PreviewSize) * TotalRotation  -- Used to get the relevant axis while accounting for rotation
+
+	local HalvedSizeOfRelativeAxis = PreviewSize[GetRelativePositionData(OffsetRotatedCFrame, CurrentTrackedPositionData.Position)]
+
+	local OffsetPosition = Position + CurrentTrackedPositionData.Normal * HalvedSizeOfRelativeAxis
+
+	if BuildMode.Settings.HeightLimitsEnabled then
+
+		local HalvedSizeOfRelativeDownAxis = PreviewSize[GetRelativePositionData(OffsetRotatedCFrame, Vector3.new(OffsetRotatedCFrame.X, -500, OffsetRotatedCFrame.Z))]
+
+		CurrentFinalCFrame = CFrame.new(OffsetPosition.X, math.clamp(OffsetPosition.Y, BuildMode.Settings.MinPlacementHeight + HalvedSizeOfRelativeDownAxis, BuildMode.Settings.MaxPlacementHeight + HalvedSizeOfRelativeDownAxis), OffsetPosition.Z) * TotalRotation
+
+	else
+
+		CurrentFinalCFrame = CFrame.new(OffsetPosition) * TotalRotation
+	end
+end
+
+local function CalculateValidateAnimate()  -- The function that is called every frame
+	
+	CalculateFinalCFrame()
+				
+	local Check = ((CurrentTrackedPositionData.Position - PlayerRoot.Position).Magnitude <= BuildMode.Settings.MaxPlacementDistance)
+	
+	local CollisionsEnabled = BuildMode.Settings.CollisionDetectionEnabled
+	
+	Check = CollisionsEnabled and not workspace:GetPartBoundsInBox(CurrentFinalCFrame, CurrentPreviewSize * 0.95, LapParams)[1] or not CollisionsEnabled
+
+	if BuildMode.Settings.BoundsEnabled and Check then
+		
+		Check = BuildMode.BoundsRegistered[1] and Check  -- When bounds are enabled in settings and there are no bounds registered then placing is disabled
+						
+		for _, Bounds in BuildMode.BoundsRegistered do 
+						
+			local RelativeAxis, AbsRelativePosition = GetRelativePositionData(CurrentFinalCFrame, Bounds.Position)  -- To correctly check if within bounds while accounting for an items rotation
+
+			AbsRelativePosition += HalvedPreviewSize
+			
+			Check = AbsRelativePosition.X < Bounds.Size.X / 2 and AbsRelativePosition.Z < Bounds.Size.Z / 2
+			
+			if Check then break end  -- If found within one of the registered bounds then we don't want to continue checking
+		end
+	end
+	
+	if not CanPlace and Check or Check and CurrentItemPreview.Highlight.FillColor == BuildMode.Settings.ColorWhenInvalid then  -- Checking the opposite CanPlace prevents spamming the tween every frame and only changes it when necessary, but sometimes it doesn't change which is why it also checks if the color is the correct one
+
+		CanPlace = true
+
+		HighlightValid:Play() 
+
+	elseif CanPlace and not Check or not Check and CurrentItemPreview.Highlight.FillColor == BuildMode.Settings.ColorWhenValid then
+
+		CanPlace = false
+		
+		HighlightInvalid:Play()
+	end
+	
+	TweenService:Create(PreviewPrimaryPart, BuildMode.Settings.PositionTweenInfo, {CFrame = CurrentFinalCFrame}):Play()
+end
+
+--Related to preview spawning
+
+local function MultiChangeTransparency(ToChange: Model | Folder | {any}, Value: number)  -- taken from a dependancy which is why it's made for general use
+
+	local ToIterateThrough = typeof(ToChange) ~= "table" and ToChange:GetDescendants() or ToChange
+
+	for i, TableOfItemsOrItem in ToIterateThrough do
+
+		TableOfItemsOrItem = TableOfItemsOrItem:IsA("BasePart") and TableOfItemsOrItem:GetDescendants() or {TableOfItemsOrItem}
+
+		for i, Part in TableOfItemsOrItem do
+
+			if Part:IsA("BasePart") and Part.Name ~= "HumanoidRootPart" or Part:IsA("Decal") then
+
+				Part.Transparency = Value
+
+			elseif Part:IsA("Accessory") then
+
+				Part.Handle.Transparency = Value
+			end
+		end
+	end
+end
+
+local function MultiChangeCollisionGroup(ToChange: Model | Folder | table, CollisionGroup: string) -- taken from a dependancy which is why it's made for general use
+
+	local ToIterateThrough = if typeof(ToChange) ~= "table" then ToChange:GetDescendants() else ToChange
+
+	for i, TableOfItemsOrItem in ToIterateThrough do
+
+		TableOfItemsOrItem = if not TableOfItemsOrItem:IsA("BasePart") then TableOfItemsOrItem:GetDescendants() else {TableOfItemsOrItem}
+
+		for i, Part in TableOfItemsOrItem do
+
+			if Part:IsA("BasePart") then
+
+				Part.CollisionGroup = CollisionGroup
+			end
+		end
+	end
+end
+
+local function HighlightPreview(Clone)
+	
+	local Highlight = Instance.new("Highlight")
+
+	Highlight.Adornee = Clone
+
+	Highlight.FillTransparency = 0.75
+
+	Highlight.FillColor = CanPlace and BuildMode.Settings.ColorWhenValid or BuildMode.Settings.ColorWhenInvalid
+
+	Highlight.OutlineColor = BuildMode.Settings.OutlineColor
+
+	Highlight.Parent = Clone
+end
+
+local function UpdateDetails(Item, Clone)
+	
+	CurrentTrackFunction()
+
+	Clone:PivotTo(CFrame.new(CurrentTrackedPositionData.Position + CurrentTrackedPositionData.Normal * HalvedPreviewSize) * (CurrentPlayerAppliedRotation * CurrentScriptAppliedRotation * CFrame.Angles(0, math.pi / 4, 0)))  -- Pivotting so that it doesn't tween from where it's origin is, also adding a little rotation to provide an animation
+
+	Clone.Parent = workspace.Humanoids.Npcs.R15  -- For some reason client-created highlights do not show unless a server-created humanoid is in the same hierarchy
+	
+	CurrentItem = Item
+
+	CurrentItemPreview = Clone
+
+	CurrentCycleListIndex = table.find(BuildMode.CycleList, Item) or 1
+
+	HighlightValid = TweenService:Create(CurrentItemPreview.Highlight, BuildMode.Settings.HighlightTweenInfo, {FillColor = BuildMode.Settings.ColorWhenValid})
+
+	HighlightInvalid = TweenService:Create(CurrentItemPreview.Highlight, BuildMode.Settings.HighlightTweenInfo, {FillColor = BuildMode.Settings.ColorWhenInvalid})
+	
+	CollectionService:AddTag(Item, BuildMode.Settings.CollisionIdentifyingTag)
+
+	CollectionService:RemoveTag(Clone, BuildMode.Settings.CollisionIdentifyingTag)  -- Prevent collision detection with self
+end
+
+local function ChangePreviewedItem(Item: Model | BasePart)
+	
+	WasteLand:AddItem(CurrentItemPreview, 0)
+
+	local Clone = Item:Clone()
+	
+	if Clone:IsA("Model") then
+
+		Clone.Archivable = true
+
+		PreviewPrimaryPart = Clone:FindFirstChild("HumanoidRootPart") or Clone.PrimaryPart or Clone:FindFirstChildWhichIsA("Model").PrimaryPart
+
+		CurrentPreviewSize = Clone:GetExtentsSize()
+		
+		MultiChangeCollisionGroup({Clone, Player.Character}, "Non-Colliding")
+
+		MultiChangeTransparency(Clone, 0.3)
+
+	else
+
+		PreviewPrimaryPart = Clone 
+
+		CurrentPreviewSize = Clone.Size
+
+		PreviewPrimaryPart.Transparency = 0.3
+
+		PreviewPrimaryPart.CanCollide = false
+	end
+
+	PreviewPrimaryPart.Anchored = true
+	
+	HalvedPreviewSize = CurrentPreviewSize / 2
+	
+	HighlightPreview(Clone)
+	
+	UpdateDetails(Item, Clone)
+end
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+--[[InfoTables]]--
+
+--Local
+
+local KeyBindData = {
+
+	["Place"] = { -- Placement handler
+
+		KeyBinds = {Enum.UserInputType.MouseButton1, Enum.KeyCode.Return},
+		
+		Enabled = true,
+
+		Function = function (_, State, _)
+
+			if not CanPlace or State ~= Enum.UserInputState.Begin then return end
+
+			PlacementHandler:FireServer(CurrentItem, CurrentFinalCFrame)
+			
+			BuildMode.Settings.PlacementSound:Play()
+			
+			return Enum.ContextActionResult.Pass
+		end,
+	},
+		
+	["StopPlace"] = { -- Stop item placement.
+		
+		KeyBinds = {Enum.KeyCode.Backspace},
+		
+		Enabled = true,
+		
+		Function = function (_, State, _)
+			
+			if State ~= Enum.UserInputState.Begin then return end
+			
+			BuildMode:StopPlacement()
+		end,
+	},
+
+	["CycUp"] = { -- Cycling up through CycleList
+
+		KeyBinds = {Enum.KeyCode.E},
+		
+		Enabled = true,
+		
+		Function = function (_, State, _)
+
+			if State ~= Enum.UserInputState.Begin then return end
+
+			CurrentCycleListIndex += 1
+
+			if CurrentCycleListIndex > #BuildMode.CycleList then CurrentCycleListIndex = 1 end
+			
+			ChangePreviewedItem(BuildMode.CycleList[CurrentCycleListIndex])
+			
+			CalculateValidateAnimate()
+		end,
+	},
+
+	["CycDown"] = { -- Cycling down through CycleList
+
+		KeyBinds = {Enum.KeyCode.Q},
+		
+		Enabled = true,
+		
+		Function = function (_, State, _)
+
+			if State ~= Enum.UserInputState.Begin then return end
+
+			CurrentCycleListIndex -= 1
+
+			if CurrentCycleListIndex == 0 then CurrentCycleListIndex = #BuildMode.CycleList end
+			
+			ChangePreviewedItem(BuildMode.CycleList[CurrentCycleListIndex])
+			
+			CalculateValidateAnimate()
+		end,
+	},
+	
+	["Rot1"] = { -- Positive Y axis item rotation
+
+		KeyBinds = {Enum.KeyCode.R},
+
+		Enabled = true,
+
+		Function = function (_, State, _)
+
+			local RotationMode = BuildMode.Settings.RotationMode
+
+			if RotationMode == 1 and State == Enum.UserInputState.Begin then
+
+				CurrentPlayerAppliedRotation *= (State == Enum.UserInputState.Begin) and CFrame.Angles(0, BuildMode.Settings.RotationValue, 0)
+
+				CalculateValidateAnimate()
+
+				return
+			end
+
+			IsPosRotating = (State == Enum.UserInputState.Begin and RotationMode == 2)
+
+			IsRotating = IsPosRotating or IsNegRotating
+
+			while IsPosRotating do
+
+				CurrentPlayerAppliedRotation *= CFrame.Angles(0, BuildMode.Settings.RotationSpeed, 0)
+
+				task.wait()
+			end
+		end,
+	},
+
+	["Rot2"] = { -- X axis item rotation OR negative Y axis rotation (IF RotationMode is equal to 2)
+
+		KeyBinds = {Enum.KeyCode.T},
+
+		Enabled = true,
+
+		Function = function (_, State, _)
+
+			local RotationMode = BuildMode.Settings.RotationMode
+
+			if RotationMode == 1 and State == Enum.UserInputState.Begin then
+
+				CurrentPlayerAppliedRotation *= CFrame.Angles(BuildMode.Settings.RotationValue, 0, 0)
+
+				CalculateValidateAnimate()
+
+				return
+			end
+
+			IsNegRotating = (State == Enum.UserInputState.Begin and RotationMode == 2)
+
+			IsRotating = IsNegRotating or IsPosRotating
+
+			while IsNegRotating do
+
+				CurrentPlayerAppliedRotation *= CFrame.Angles(0, -BuildMode.Settings.RotationSpeed, 0)
+
+				task.wait()
+			end
+		end,
+	},
+	
+	["MoveDis1"] = { -- Increasing the distance between player and previewed part by holding keycodes (Used for placement modes 2 and 3)
+
+		KeyBinds = {Enum.KeyCode.O, Enum.KeyCode.C},
+
+		Enabled = false,
+
+		Function = function (_, State, _)
+
+			IsPosMoving = State == Enum.UserInputState.Begin and true
+
+			while IsPosMoving and CurrentPlacementDistance <= BuildMode.Settings.MaxPlacementDistance do
+
+				CurrentPlacementDistance += 1
+
+				task.wait()
+			end
+		end,
+	},
+	
+	["MoveDis2"] = { -- Decreasing the distance between player and previewed part by holding keycodes (Used for placement modes 2 and 3)
+
+		KeyBinds = {Enum.KeyCode.I, Enum.KeyCode.V},
+
+		Enabled = false,
+
+		Function = function (_, State, _)
+
+			IsNegMoving = State == Enum.UserInputState.Begin and true
+
+			while IsNegMoving and CurrentPlacementDistance >= 1 do
+
+				CurrentPlacementDistance -= 1
+				
+				task.wait()
+			end
+		end,
+	},
+	
+	["MoveDis3"] = { -- Changing distance between player and previewed part using mouse scroll (Used for placement modes 2 and 3)
+		
+		KeyBinds = {Enum.UserInputType.MouseWheel},
+		
+		Enabled = false,
+		
+		Function = function (_, State, Input)
+										
+			CurrentPlacementDistance = math.clamp(CurrentPlacementDistance + Input.Position.Z * 5, 0, BuildMode.Settings.MaxPlacementDistance)
+		end,
+	},
+}
+
+local PlacementModes = { -- Position tracking functions for PlacementModes.
+	
+	[1] = function () -- At the player's mouse
+
+		local MouseXY = UserInputService:GetMouseLocation()
+
+		local Ray = Camera:ViewportPointToRay(MouseXY.X, MouseXY.Y)
+
+		CurrentTrackedPositionData = workspace:Raycast(Ray.Origin, Ray.Direction * 200, RayParams) or {}
+	end,
+	
+	
+	[2] = function () -- Infront of the player
+		
+		local LookVector = PlayerRoot.CFrame.LookVector
+		
+		CurrentTrackedPositionData = workspace:Raycast((LookVector * (CurrentPlacementDistance + HalvedPreviewSize[GetRelativePositionData(CFrame.new((LookVector * 1) + PlayerRoot.Position) * (CurrentScriptAppliedRotation * CurrentPlayerAppliedRotation), PlayerRoot.Position)]) + PlayerRoot.Position), -PlayerRoot.CFrame.UpVector * 100, RayParams) or {}  -- This calculation ensures that no matter the rotation or size of an object, it will always stay at the same distance infront of the player
+		
+		CurrentScriptAppliedRotation = PlayerRoot.CFrame.Rotation * CFrame.Angles(0, math.pi, 0)
+	end,
+	
+	[3] = function () -- At camera center
+		
+		local Direction = Camera.CFrame.LookVector * CurrentPlacementDistance 
+		
+		CurrentTrackedPositionData = workspace:Raycast(Camera.CFrame.Position, Direction, RayParams) or {Position = Camera.CFrame.Position + Direction, Normal = Vector3.new(0, 1, 0)}
+		
+		CurrentScriptAppliedRotation = PlayerRoot.CFrame.Rotation * CFrame.Angles(0, math.pi, 0)
+	end,	
+}
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+--[[Global Functions]]--
+
+function BuildMode:StartPlacement(Item: Model | BasePart, Type : string?) : Model | BasePart
+		
+	if RunServiceConnection then BuildMode:StopPlacement() end
+	
+	CurrentTrackFunction = PlacementModes[BuildMode.Settings.PlacementMode]
+
+	ChangePreviewedItem(Item)
+	
+	RunServiceConnection = RunService.PreRender:Connect(function (DelaTime)
+				
+		CurrentTrackFunction()
+															
+		if CurrentTrackedPositionData.Position and LastPosition ~= CurrentTrackedPositionData.Position or CurrentTrackedPositionData.Position and IsRotating then  -- This check decreases script activtiy to 0% when the position isn't changing
+												
+			CalculateValidateAnimate()
+		end
+	end)
+	
+	CollectionServiceConnection = CollectionService:GetInstanceAddedSignal(BuildMode.Settings.CollisionIdentifyingTag):Connect(function ()
+		
+		LapParams.FilterDescendantsInstances = {CollectionService:GetTagged(BuildMode.Settings.CollisionIdentifyingTag)}  -- Update the collision detection list, but not every frame
+	end)
+	
+	for i, KeyBindEntry in KeyBindData do
+
+		if KeyBindEntry.Enabled then
+
+			ContextActionService:BindAction(i, KeyBindEntry.Function, true, table.unpack(KeyBindEntry.KeyBinds))
+		end
+	end
+	
+	return CurrentItemPreview
+end
+
+function BuildMode:StopPlacement()
+
+	RunServiceConnection:Disconnect()
+	
+	CollectionServiceConnection:Disconnect()
+
+	WasteLand:AddItem(CurrentItemPreview, 0)
+
+	CurrentPlayerAppliedRotation = CFrame.Angles(0, 0, 0)
+	
+	CurrentScriptAppliedRotation = CFrame.Angles(0, 0, 0)
+	
+	for i, KeyBindEntry in KeyBindData do
+
+		ContextActionService:UnbindAction(i)
+	end
+end
+
+function BuildMode:SetPlacementMode(PlacementMode : number)
+	
+	BuildMode.Settings.PlacementMode = math.clamp(PlacementMode, 1, #PlacementModes)
+	
+	CurrentTrackFunction = PlacementModes[PlacementMode]
+end
+
+function BuildMode:SetActionEnabled(ActionName: string, Enabled: boolean)
+	
+	local KeyBindEntry = KeyBindData[ActionName] or {}
+
+	KeyBindEntry.Enabled = Enabled
+	
+	if Enabled and RunServiceConnection then
+		
+		ContextActionService:BindAction(ActionName, KeyBindEntry.Function, true, table.unpack(KeyBindEntry.KeyBinds))
+		
+		return
+	end
+	
+	ContextActionService:UnbindAction(ActionName)
+end
+
+function BuildMode:SetRotationRelativeTo(RelativeToCFrame : CFrame)
+	
+	CurrentScriptAppliedRotation = typeof(RelativeToCFrame) == "CFrame" and RelativeToCFrame.Rotation or ZeroCFrame
+end
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+return BuildMode
